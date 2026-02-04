@@ -1,1 +1,1 @@
-# FA-MFMR
+This repository contains code necessary to reproduce the results in the manuscript: A factor-augmented multivariable functional Mendelian randomization framework to disentangle time-varying effects of multiple correlated exposures with application to Parkinson's disease progression
