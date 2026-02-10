@@ -1938,10 +1938,6 @@ plot_bootstrap_ci_improved <- function(bootstrap_results,
 }
 
 
-# ===================================================================
-# 使用示例
-# ===================================================================
-
 results <- improved_block_bootstrap_fixed(
   ppmi_data = ppmi_data,
   B = 500,
