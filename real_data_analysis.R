@@ -1432,91 +1432,40 @@ plot_beta_comparison <- function(FA_MFMR_results,
 
 
 
-smooth_beta_function <- function(beta_values, time_grid, method = "loess",
-                                 span = 0.15, df = 10) {
-  
-  valid_idx <- !is.na(beta_values)
-  if (sum(valid_idx) < 3) return(beta_values)
-  
-  if (method == "loess") {
-    tryCatch({
-      smoothed <- stats::lowess(x = time_grid[valid_idx],
-                                y = beta_values[valid_idx],
-                                f = span)
-      result <- approx(x = smoothed$x, y = smoothed$y,
-                       xout = time_grid, rule = 2)$y
-      return(result)
-    }, error = function(e) beta_values)
-    
-  } else if (method == "spline") {
-    tryCatch({
-      fit <- smooth.spline(x = time_grid[valid_idx],
-                           y = beta_values[valid_idx],
-                           df = df)
-      result <- predict(fit, x = time_grid)$y
-      return(result)
-    }, error = function(e) beta_values)
-    
-  } else {
-    return(beta_values)
-  }
-}
-
-
-
-run_block_bootstrap_iter <- function(b, ppmi_data, n, G, block_length,
+run_block_bootstrap_iter <- function(b, ppmi_data, block_length,
                                      FVE_threshold, K_max_search, cv_folds,
-                                     smooth_method, smooth_span) {
+                                     verbose_iter = FALSE) {
   
   tryCatch({
     n_actual <- length(ppmi_data$Y)
     G_actual <- ppmi_data$G
     
-    # 【关键】生成Block重采样索引
-    # 将样本分成blocks，然后重采样整个blocks
+    # ===== Block重采样 =====
     n_blocks <- ceiling(n_actual / block_length)
     block_ids <- sample(1:n_blocks, size = n_blocks, replace = TRUE)
     
-    # 展开为实际的样本索引
+    # 展开为样本索引
     boot_sample_ids <- c()
     for (bid in block_ids) {
       start_idx <- (bid - 1) * block_length + 1
       end_idx <- min(bid * block_length, n_actual)
       boot_sample_ids <- c(boot_sample_ids, start_idx:end_idx)
     }
-    
-    # 截断到原始样本量
     boot_sample_ids <- boot_sample_ids[1:n_actual]
     
-    # 检查数据结构
-    is_nested <- length(ppmi_data$Ly_list) == G_actual
+    # ===== 构造重采样数据 =====
+    Ly_boot <- lapply(ppmi_data$Ly_list, function(ly) {
+      ly[boot_sample_ids]
+    })
     
-    if (is_nested) {
-      Ly_boot <- lapply(1:G_actual, function(g) {
-        lapply(boot_sample_ids, function(i) {
-          ppmi_data$Ly_list[[g]][[i]]
-        })
-      })
-      
-      Lt_boot <- lapply(1:G_actual, function(g) {
-        lapply(boot_sample_ids, function(i) {
-          ppmi_data$Lt_list[[g]][[i]]
-        })
-      })
-    } else {
-      Ly_boot <- lapply(boot_sample_ids, function(i) {
-        ppmi_data$Ly_list[[i]]
-      })
-      
-      Lt_boot <- lapply(boot_sample_ids, function(i) {
-        ppmi_data$Lt_list[[i]]
-      })
-    }
+    Lt_boot <- lapply(ppmi_data$Lt_list, function(lt) {
+      lt[boot_sample_ids]
+    })
     
     Y_boot <- ppmi_data$Y[boot_sample_ids]
     Z_boot <- ppmi_data$Z[boot_sample_ids, , drop = FALSE]
     
-    # 运行LM_MFMR
+    # ===== 运行LM_MFMR =====
     boot_results <- LM_MFMR(
       Ly_list = Ly_boot,
       Lt_list = Lt_boot,
@@ -1525,52 +1474,43 @@ run_block_bootstrap_iter <- function(b, ppmi_data, n, G, block_length,
       FVE_threshold = FVE_threshold,
       K_max_search = K_max_search,
       cv_folds = cv_folds,
+      use_bic = FALSE,
       verbose = FALSE
     )
     
-    if (is.null(boot_results) || is.null(boot_results$beta_functions)) {
-      return(list(success = FALSE, error = "LM_MFMR returned NULL", iter = b))
+    if (is.null(boot_results) || !boot_results$success) {
+      return(list(success = FALSE, error = "LM_MFMR failed", iter = b))
     }
     
-    # 提取并平滑beta函数
-    time_grids <- lapply(boot_results$beta_functions, function(bf) bf$time)
-    beta_values <- lapply(1:G_actual, function(g) {
-      beta_raw <- boot_results$beta_functions[[g]]$beta
-      
-      if (is.null(beta_raw) || length(beta_raw) == 0) {
-        return(NULL)
-      }
-      
-      # 平滑
-      if (smooth_method != "none") {
-        smooth_beta_function(beta_raw, time_grids[[g]], 
-                             method = smooth_method, span = smooth_span)
-      } else {
-        beta_raw
-      }
-    })
-    
-    n_valid_beta <- sum(sapply(beta_values, function(x) !is.null(x)))
-    
-    if (n_valid_beta == G_actual) {
-      return(list(success = TRUE, beta_values = beta_values, iter = b))
-    } else {
-      return(list(success = FALSE, error = "Invalid beta functions", iter = b))
-    }
+    # ===== 返回结果 =====
+    return(list(
+      success = TRUE,
+      est_beta_mat = boot_results$est_beta_mat,  # 关键：返回est_beta_mat
+      fpca_list = boot_results$fpca_list,        # 保存fpca用于重构
+      m_vec = boot_results$m_vec,                # 各trait的PC数
+      iter = b
+    ))
     
   }, error = function(e) {
     return(list(success = FALSE, error = as.character(e), iter = b))
   })
 }
 
-execute_block_bootstrap <- function(B, n, G, ppmi_data, block_length,
-                                    FVE_threshold, K_max_search, cv_folds,
-                                    smooth_method, smooth_span,
-                                    parallel = TRUE, n_cores = NULL,
+
+# ===================================================================
+# 执行Block Bootstrap并行计算
+# ===================================================================
+
+execute_block_bootstrap <- function(B, ppmi_data, block_length,
+                                    FVE_threshold = 0.95,
+                                    K_max_search = NULL,
+                                    cv_folds = 10,
+                                    parallel = TRUE,
+                                    n_cores = NULL,
                                     verbose = TRUE) {
   
   if (parallel && is.null(n_cores)) {
-    n_cores <- max(1, parallel::detectCores() - 1)
+    n_cores <- 10
   }
   
   bootstrap_results <- NULL
@@ -1582,6 +1522,7 @@ execute_block_bootstrap <- function(B, n, G, ppmi_data, block_length,
       
       cl <- parallel::makeCluster(n_cores)
       
+      # 导出必要的函数到并行环境
       all_funcs <- ls(.GlobalEnv)
       func_list <- all_funcs[sapply(all_funcs, function(x) {
         is.function(get(x, envir = .GlobalEnv))
@@ -1589,6 +1530,7 @@ execute_block_bootstrap <- function(B, n, G, ppmi_data, block_length,
       
       parallel::clusterExport(cl, varlist = func_list, envir = .GlobalEnv)
       
+      # 导入必要的包
       parallel::clusterEvalQ(cl, {
         suppressPackageStartupMessages({
           library(MASS, quietly = TRUE)
@@ -1607,18 +1549,16 @@ execute_block_bootstrap <- function(B, n, G, ppmi_data, block_length,
       
       bootstrap_results <- parallel::parLapply(
         cl, 1:B,
-        function(b, ppmi_data, n, G, block_length, FVE_threshold, 
-                 K_max_search, cv_folds, smooth_method, smooth_span) {
+        function(b, ppmi_data, block_length, FVE_threshold, 
+                 K_max_search, cv_folds) {
           run_block_bootstrap_iter(
-            b, ppmi_data, n, G, block_length,
-            FVE_threshold, K_max_search, cv_folds,
-            smooth_method, smooth_span
+            b, ppmi_data, block_length,
+            FVE_threshold, K_max_search, cv_folds
           )
         },
-        ppmi_data = ppmi_data, n = n, G = G, block_length = block_length,
+        ppmi_data = ppmi_data, block_length = block_length,
         FVE_threshold = FVE_threshold, K_max_search = K_max_search,
-        cv_folds = cv_folds, smooth_method = smooth_method, 
-        smooth_span = smooth_span
+        cv_folds = cv_folds
       )
       
       if (verbose) {
@@ -1650,9 +1590,8 @@ execute_block_bootstrap <- function(B, n, G, ppmi_data, block_length,
     
     for (b in 1:B) {
       bootstrap_results[[b]] <- run_block_bootstrap_iter(
-        b, ppmi_data, n, G, block_length,
-        FVE_threshold, K_max_search, cv_folds,
-        smooth_method, smooth_span
+        b, ppmi_data, block_length,
+        FVE_threshold, K_max_search, cv_folds
       )
       
       if (verbose) setTxtProgressBar(pb, b)
@@ -1664,40 +1603,59 @@ execute_block_bootstrap <- function(B, n, G, ppmi_data, block_length,
   return(bootstrap_results)
 }
 
+
+# ===================================================================
+# 计算置信区间（标准百分位法，无修正）
+# ===================================================================
+
+compute_ci_percentile <- function(beta_boot_values, alpha = 0.05) {
+  
+  beta_boot_values <- beta_boot_values[!is.na(beta_boot_values)]
+  
+  if (length(beta_boot_values) < 5) {
+    return(list(lower = NA, upper = NA))
+  }
+  
+  lower <- quantile(beta_boot_values, probs = alpha/2, na.rm = TRUE)
+  upper <- quantile(beta_boot_values, probs = 1 - alpha/2, na.rm = TRUE)
+  
+  list(lower = lower, upper = upper)
+}
+
+
+# ===================================================================
+# 主函数：improved_block_bootstrap_fixed
+# ===================================================================
+
 improved_block_bootstrap_fixed <- function(ppmi_data,
                                            B = 2000,
                                            block_length = NULL,
-                                           smooth_method = "loess",
-                                           smooth_span = 0.15,
                                            FVE_threshold = 0.95,
                                            K_max_search = NULL,
                                            cv_folds = 10,
                                            confidence_level = 0.95,
                                            parallel = TRUE,
                                            n_cores = NULL,
-                                           # 【关键参数】
-                                           ci_method = "basic_plus",  # "basic_plus" "percentile_adaptive" 等
-                                           min_coverage = 0.95,       # 最小覆盖目标
                                            verbose = TRUE,
                                            seed = 123) {
   
   set.seed(seed)
-  n <- ppmi_data$n
-  G <- ppmi_data$G
   
   if (verbose) {
     cat("\n", paste(rep("=", 80), collapse = ""), "\n")
-    cat("【强化修复方案】确保曲线100%在置信带内\n")
+    cat("Block Bootstrap置信区间 (诚实版)\n")
+    cat("适配: LM_MFMR_complete_modified.R\n")
     cat(paste(rep("=", 80), collapse = ""), "\n\n")
-    cat("✓ 使用对称化Bootstrap CI（确保覆盖）\n")
-    cat("✓ 动态调整分位数（保证最小覆盖95%）\n")
-    cat("✓ 多重覆盖检验和自适应扩展\n\n")
+    cat(sprintf("Bootstrap次数: %d\n", B))
+    cat(sprintf("置信水平: %.0f%%\n", confidence_level * 100))
+    cat("方法: 标准百分位法（无修正）\n\n")
   }
   
   # ===================================================================
-  # 步骤1：运行原始估计
+  # 步骤1：原始估计
   # ===================================================================
-  if (verbose) cat("【步骤1】运行原始LM-MFMR估计...\n")
+  
+  if (verbose) cat("【步骤1】计算原始LM-MFMR估计...\n")
   
   original_results <- LM_MFMR(
     Ly_list = ppmi_data$Ly_list,
@@ -1707,29 +1665,22 @@ improved_block_bootstrap_fixed <- function(ppmi_data,
     FVE_threshold = FVE_threshold,
     K_max_search = K_max_search,
     cv_folds = cv_folds,
+    use_bic = FALSE,
     verbose = FALSE
   )
   
-  time_grids <- lapply(original_results$beta_functions, function(bf) bf$time)
-  beta_original_raw <- lapply(original_results$beta_functions, function(bf) bf$beta)
-  
-  if (smooth_method != "none") {
-    beta_original <- lapply(1:G, function(g) {
-      smooth_beta_function(beta_original_raw[[g]], time_grids[[g]], 
-                           method = smooth_method, span = smooth_span)
-    })
-  } else {
-    beta_original <- beta_original_raw
+  if (is.null(original_results) || !original_results$success) {
+    stop("原始估计失败")
   }
   
   if (verbose) cat("✓ 原始估计完成\n")
   
   # ===================================================================
-  # 步骤2：Block长度设定
+  # 步骤2：确定Block长度
   # ===================================================================
   
   if (is.null(block_length)) {
-    mean_obs_per_sample <- mean(sapply(ppmi_data$Ly_list, length))
+    mean_obs_per_sample <- mean(sapply(ppmi_data$Ly_list[[1]], length))
     block_length <- max(3, min(5, ceiling(mean_obs_per_sample / 20)))
   }
   
@@ -1739,22 +1690,18 @@ improved_block_bootstrap_fixed <- function(ppmi_data,
   }
   
   # ===================================================================
-  # 步骤3：Block Bootstrap重采样
+  # 步骤3：执行Block Bootstrap
   # ===================================================================
   
-  if (verbose) cat("\n【步骤3】执行Block Bootstrap重采样...\n")
+  if (verbose) cat("\n【步骤3】执行Block Bootstrap...\n")
   
   bootstrap_results <- execute_block_bootstrap(
     B = B,
-    n = n,
-    G = G,
     ppmi_data = ppmi_data,
     block_length = block_length,
     FVE_threshold = FVE_threshold,
     K_max_search = K_max_search,
     cv_folds = cv_folds,
-    smooth_method = smooth_method,
-    smooth_span = smooth_span,
     parallel = parallel,
     n_cores = n_cores,
     verbose = verbose
@@ -1772,249 +1719,107 @@ improved_block_bootstrap_fixed <- function(ppmi_data,
               success_count, B, 100 * success_count / B))
   
   if (length(successful_boots) < 20) {
-    stop(sprintf("Block Bootstrap失败: %d < 20", length(successful_boots)))
+    stop(sprintf("Bootstrap失败: 成功样本数 %d < 20", length(successful_boots)))
   }
   
   # ===================================================================
-  # 辅助函数：【增强版】CI计算
-  # ===================================================================
-  
-  # 方法1：对称化Bootstrap CI（最稳健）
-  compute_ci_symmetrized <- function(theta_hat, boot_vals, alpha) {
-    boot_vals <- boot_vals[!is.na(boot_vals)]
-    if (length(boot_vals) < 10) return(list(lower = NA, upper = NA, is_adjusted = FALSE))
-    
-    # 步骤1：计算bootstrap分布统计
-    boot_mean <- mean(boot_vals)
-    boot_median <- median(boot_vals)
-    boot_sd <- sd(boot_vals)
-    
-    # 步骤2：相对于bootstrap中位数对称化
-    boot_centered <- boot_vals - boot_median
-    boot_symmetric <- c(boot_centered, -boot_centered)  # 强制对称
-    
-    # 步骤3：使用对称化分布计算分位数
-    q_val <- quantile(boot_symmetric, probs = 1 - alpha/2, na.rm = TRUE)
-    
-    # 步骤4：构造CI（以原估计为中心）
-    lower <- theta_hat - q_val
-    upper <- theta_hat + q_val
-    
-    list(lower = lower, upper = upper, is_adjusted = TRUE)
-  }
-  
-  # 方法2：自适应百分位法（根据coverage动态调整）
-  compute_ci_adaptive <- function(theta_hat, boot_vals, alpha, target_coverage = 0.95) {
-    boot_vals <- boot_vals[!is.na(boot_vals)]
-    if (length(boot_vals) < 10) return(list(lower = NA, upper = NA, is_adjusted = FALSE))
-    
-    # 初始分位数
-    p_lower <- alpha/2
-    p_upper <- 1 - alpha/2
-    
-    # 迭代调整直到达到目标覆盖率
-    adjusted <- FALSE
-    for (iter in 1:10) {
-      lower <- quantile(boot_vals, probs = p_lower, na.rm = TRUE)
-      upper <- quantile(boot_vals, probs = p_upper, na.rm = TRUE)
-      
-      # 检查theta_hat是否在CI内
-      if (theta_hat >= lower && theta_hat <= upper) {
-        break  # 已覆盖，停止调整
-      }
-      
-      # 扩大覆盖范围
-      adjust_factor <- 1.1  # 每次扩大10%
-      p_lower <- p_lower / adjust_factor
-      p_upper <- 1 - (1 - p_upper) / adjust_factor
-      p_lower <- max(0.001, p_lower)
-      p_upper <- min(0.999, p_upper)
-      
-      adjusted <- TRUE
-    }
-    
-    lower <- quantile(boot_vals, probs = p_lower, na.rm = TRUE)
-    upper <- quantile(boot_vals, probs = p_upper, na.rm = TRUE)
-    
-    list(lower = lower, upper = upper, is_adjusted = adjusted)
-  }
-  
-  # 方法3：强制覆盖法（最后手段 - 确保100%覆盖）
-  compute_ci_forced_coverage <- function(theta_hat, boot_vals, alpha) {
-    boot_vals <- boot_vals[!is.na(boot_vals)]
-    if (length(boot_vals) < 10) return(list(lower = NA, upper = NA, is_adjusted = TRUE))
-    
-    # 计算与原估计的距离
-    distances <- abs(boot_vals - theta_hat)
-    
-    # 根据目标alpha找到合适的距离阈值
-    target_quantile <- 1 - alpha/2
-    distance_threshold <- quantile(distances, probs = target_quantile, na.rm = TRUE)
-    
-    # 确保阈值足够大（最少为bootstrap SD的1.5倍）
-    boot_sd <- sd(boot_vals)
-    distance_threshold <- max(distance_threshold, 1.5 * boot_sd)
-    
-    lower <- theta_hat - distance_threshold
-    upper <- theta_hat + distance_threshold
-    
-    list(lower = lower, upper = upper, is_adjusted = TRUE)
-  }
-  
-  # ===================================================================
-  # 步骤4：【强化核心】计算置信区间
+  # 步骤4：计算置信区间
   # ===================================================================
   
   if (verbose) {
-    cat("\n【步骤4】计算置信区间（增强版）...\n")
-    cat(sprintf("  方法: %s\n", ci_method))
-    cat(sprintf("  目标覆盖: %.1f%%\n\n", 100 * min_coverage))
+    cat("\n【步骤4】计算置信区间（百分位法）...\n\n")
   }
   
-  confidence_intervals <- vector("list", G)
+  G <- ppmi_data$G
   alpha <- 1 - confidence_level
+  confidence_intervals <- vector("list", G)
   
   for (g in 1:G) {
-    time_grid <- time_grids[[g]]
-    n_timepoints <- length(time_grid)
-    beta_obs <- beta_original[[g]]
     
-    # 收集bootstrap beta值
-    beta_matrix <- matrix(NA, nrow = length(successful_boots), ncol = n_timepoints)
+    # 获取原始估计的fpca和系数
+    fpca_g <- original_results$fpca_list[[g]]
+    est_coef_g <- original_results$est_beta_mat[[g]]
+    m_g <- original_results$m_vec[g]
+    
+    # 获取时间网格和basis函数
+    time_grid <- fpca_g$workGrid
+    phi_g <- fpca_g$phi[, 1:m_g, drop = FALSE]
+    
+    # 重构原始曲线
+    beta_original <- as.vector(phi_g %*% est_coef_g)
+    
+    n_timepoints <- length(time_grid)
+    
+    # ===== 收集Bootstrap样本的系数 =====
+    boot_coef_matrix <- matrix(NA, nrow = length(successful_boots), ncol = m_g)
     
     for (i in 1:length(successful_boots)) {
       tryCatch({
-        beta_boot <- successful_boots[[i]]$beta_values[[g]]
-        if (!is.null(beta_boot) && length(beta_boot) == n_timepoints) {
-          beta_matrix[i, ] <- beta_boot
+        boot_est_coef <- successful_boots[[i]]$est_beta_mat[[g]]
+        
+        if (!is.null(boot_est_coef) && length(boot_est_coef) == m_g) {
+          boot_coef_matrix[i, ] <- boot_est_coef
         }
       }, error = function(e) {})
     }
     
-    beta_matrix <- beta_matrix[complete.cases(beta_matrix), , drop = FALSE]
+    # 移除含有NA的行
+    complete_rows <- rowSums(!is.na(boot_coef_matrix)) == m_g
+    boot_coef_matrix_clean <- boot_coef_matrix[complete_rows, , drop = FALSE]
     
-    if (nrow(beta_matrix) < 20) {
-      warning(sprintf("Group %d有效bootstrap样本太少(%d)", g, nrow(beta_matrix)))
+    if (nrow(boot_coef_matrix_clean) < 20) {
+      warning(sprintf("Group %d有效bootstrap样本太少 (%d)", g, nrow(boot_coef_matrix_clean)))
+      confidence_intervals[[g]] <- NULL
       next
     }
     
-    # 改进的异常值检测
-    beta_matrix_cleaned <- apply(beta_matrix, 2, function(x) {
-      median_x <- median(x, na.rm = TRUE)
-      mad_x <- mad(x, na.rm = TRUE)
-      
-      if (mad_x < 1e-6) {
-        Q1 <- quantile(x, 0.25, na.rm = TRUE)
-        Q3 <- quantile(x, 0.75, na.rm = TRUE)
-        threshold <- 2.5 * (Q3 - Q1)
-      } else {
-        threshold <- 3.5 * mad_x
-      }
-      
-      lower_bound <- median_x - threshold
-      upper_bound <- median_x + threshold
-      
-      x[x < lower_bound | x > upper_bound] <- NA
-      x
-    })
-    
-    valid_rows <- apply(beta_matrix_cleaned, 1, 
-                        function(x) sum(!is.na(x)) > n_timepoints * 0.6)
-    
-    if (sum(valid_rows) < 20) {
-      beta_matrix_cleaned <- beta_matrix
-    } else {
-      beta_matrix_cleaned <- beta_matrix_cleaned[valid_rows, ]
-    }
-    
-    # ===== 计算置信区间 =====
+    # ===== 在每个时间点计算置信区间 =====
     lower_ci <- numeric(n_timepoints)
     upper_ci <- numeric(n_timepoints)
-    coverage_check <- logical(n_timepoints)
-    adjustment_count <- 0
     
     for (j in 1:n_timepoints) {
-      boot_vals <- beta_matrix_cleaned[, j]
+      # 计算每个bootstrap样本在时间点j的β值
+      phi_j <- phi_g[j, ]  # 第j个时间点的basis函数值
       
-      if (ci_method == "basic_plus") {
-        # ===== 增强的Basic法 =====
-        ci_result <- compute_ci_symmetrized(beta_obs[j], boot_vals, alpha)
-        lower_ci[j] <- ci_result$lower
-        upper_ci[j] <- ci_result$upper
-        
-        # 如果仍然不覆盖，使用强制覆盖法
-        if (beta_obs[j] < lower_ci[j] || beta_obs[j] > upper_ci[j]) {
-          ci_result <- compute_ci_forced_coverage(beta_obs[j], boot_vals, alpha)
-          lower_ci[j] <- ci_result$lower
-          upper_ci[j] <- ci_result$upper
-          adjustment_count <- adjustment_count + 1
-        }
-        
-      } else if (ci_method == "percentile_adaptive") {
-        # ===== 自适应百分位法 =====
-        ci_result <- compute_ci_adaptive(beta_obs[j], boot_vals, alpha, 
-                                         target_coverage = min_coverage)
-        lower_ci[j] <- ci_result$lower
-        upper_ci[j] <- ci_result$upper
-        
-      } else {
-        # ===== 默认：强制覆盖法 =====
-        ci_result <- compute_ci_forced_coverage(beta_obs[j], boot_vals, alpha)
-        lower_ci[j] <- ci_result$lower
-        upper_ci[j] <- ci_result$upper
-      }
+      boot_beta_j <- as.vector(boot_coef_matrix_clean %*% phi_j)
+      
+      # 计算百分位CI
+      ci_result <- compute_ci_percentile(boot_beta_j, alpha = alpha)
+      
+      lower_ci[j] <- ci_result$lower
+      upper_ci[j] <- ci_result$upper
     }
     
-    # 最终覆盖检验（绝对保证）
-    coverage_check <- (beta_obs >= lower_ci) & (beta_obs <= upper_ci)
-    
-    if (!all(coverage_check, na.rm = TRUE)) {
-      # 如果仍有不覆盖的点，最后的安全机制：扩展CI
-      out_of_bounds_idx <- which(!coverage_check)
-      for (idx in out_of_bounds_idx) {
-        current_width <- upper_ci[idx] - lower_ci[idx]
-        
-        if (beta_obs[idx] < lower_ci[idx]) {
-          lower_ci[idx] <- beta_obs[idx] - 0.1 * current_width
-        }
-        if (beta_obs[idx] > upper_ci[idx]) {
-          upper_ci[idx] <- beta_obs[idx] + 0.1 * current_width
-        }
-        
-        adjustment_count <- adjustment_count + 1
-      }
-    }
-    
-    # 重新检验
-    coverage_check <- (beta_obs >= lower_ci) & (beta_obs <= upper_ci)
+    # ===== 诊断性覆盖检验 =====
+    coverage_check <- (beta_original >= lower_ci) & (beta_original <= upper_ci)
     coverage_pct <- 100 * mean(coverage_check, na.rm = TRUE)
     avg_width <- mean(upper_ci - lower_ci, na.rm = TRUE)
     
     confidence_intervals[[g]] <- list(
       time = time_grid,
-      beta_original = beta_obs,
-      beta_original_raw = beta_original_raw[[g]],
+      beta_original = beta_original,
+      beta_original_raw = est_coef_g,  # 系数
       lower_ci = lower_ci,
       upper_ci = upper_ci,
       coverage = coverage_check,
-      n_successful = nrow(beta_matrix_cleaned),
-      method = ci_method,
-      n_boot_used = nrow(beta_matrix_cleaned),
       coverage_pct = coverage_pct,
       avg_width = avg_width,
-      n_adjusted = adjustment_count
+      n_boot_used = nrow(boot_coef_matrix_clean),
+      method = "percentile"
     )
     
     if (verbose) {
-      cat(sprintf("  Group %d: 宽度=%.4f, 覆盖=%.1f%%, 调整点数=%d, n_boot=%d\n",
-                  g, avg_width, coverage_pct, adjustment_count, nrow(beta_matrix_cleaned)))
+      cat(sprintf("  Group %d: 宽度=%.6f, 覆盖=%.1f%%, n_boot=%d\n",
+                  g, avg_width, coverage_pct, nrow(boot_coef_matrix_clean)))
     }
   }
   
   if (verbose) {
-    cat("\n✓ 置信区间计算完成!\n")
-    cat("✓ 所有曲线100%在置信带内!\n")
-    cat("✓ CI宽度已优化!\n")
+    cat("\n✓ 置信区间计算完成\n")
+    cat("说明:\n")
+    cat("- 使用标准百分位法，无任何修正或强制覆盖\n")
+    cat("- 覆盖率反映真实的Bootstrap变异性\n")
+    cat("- 覆盖率<95%是正常的（有限样本现象）\n")
     cat(paste(rep("=", 80), collapse = ""), "\n\n")
   }
   
@@ -2025,22 +1830,25 @@ improved_block_bootstrap_fixed <- function(ppmi_data,
     n_bootstrap = B,
     n_successful = success_count,
     confidence_level = confidence_level,
-    ci_method = ci_method,
+    ci_method = "percentile",
     block_length = block_length,
-    traits = ppmi_data$traits
+    traits = ppmi_data$traits,
+    G = G
   ))
 }
 
+
 # ===================================================================
-# 绘制改进的置信区间图
+# 绘制置信区间
 # ===================================================================
+
 plot_bootstrap_ci_improved <- function(bootstrap_results,
                                        group_names = NULL,
                                        select_groups = NULL,
                                        ci_alpha = 0.25) {
   
   confidence_intervals <- bootstrap_results$confidence_intervals
-  G <- length(confidence_intervals)
+  G <- bootstrap_results$G
   
   if (is.null(select_groups)) {
     select_groups <- 1:G
@@ -2069,7 +1877,11 @@ plot_bootstrap_ci_improved <- function(bootstrap_results,
     
     tryCatch({
       ci_result <- confidence_intervals[[g]]
-      if (is.null(ci_result)) next
+      if (is.null(ci_result)) {
+        plot(1, 1, type = "n", xlab = "", ylab = "", 
+             main = paste(group_names[i], "(无数据)"))
+        next
+      }
       
       time <- ci_result$time
       beta <- ci_result$beta_original
@@ -2078,40 +1890,42 @@ plot_bootstrap_ci_improved <- function(bootstrap_results,
       coverage_pct <- ci_result$coverage_pct
       avg_width <- ci_result$avg_width
       n_boot <- ci_result$n_boot_used
-      n_adj <- ci_result$n_adjusted
       
-      ylim <- range(c(beta, lower, upper), na.rm = TRUE)
+      # 移除NA值用于画图
+      valid_idx <- !is.na(lower) & !is.na(upper) & !is.na(beta)
+      
+      ylim <- range(c(beta[valid_idx], lower[valid_idx], upper[valid_idx]), na.rm = TRUE)
       ylim <- ylim + c(-0.15, 0.15) * diff(ylim)
       
       col_main <- cols[i]
       col_ci <- adjustcolor(col_main, alpha.f = ci_alpha)
       
+      # 绘制背景
       plot(time, beta, type = "n", ylim = ylim,
            xlab = "", ylab = "", main = "")
       
-      polygon(c(time, rev(time)), c(lower, rev(upper)),
+      # 绘制CI阴影
+      polygon(c(time[valid_idx], rev(time[valid_idx])), 
+              c(lower[valid_idx], rev(upper[valid_idx])),
               col = col_ci, border = NA)
       
+      # 绘制CI边界
       lines(time, lower, col = col_main, lty = 2, lwd = 1)
       lines(time, upper, col = col_main, lty = 2, lwd = 1)
       
-      lines(time, beta, col = col_main, lwd = 2.8)
+      # 绘制原始曲线
+      lines(time, beta, col = col_main, lwd = 2.5)
       
+      # 参考线
       abline(h = 0, col = "gray50", lty = 2, lwd = 0.8)
-      
       grid(col = "gray90", lty = 3)
       
-      coverage_status <- ifelse(coverage_pct >= 99.5, "✓", "⚠")
-      plot_title <- sprintf("%s %s\n覆盖: %.1f%% | 宽度: %.4f | n_boot: %d",
-                            group_names[i], coverage_status, coverage_pct, avg_width, n_boot)
+      # 标题
+      plot_title <- sprintf("%s\n覆盖: %.1f%% | 宽度: %.4f | n_boot: %d",
+                            group_names[i], coverage_pct, avg_width, n_boot)
       
-      if (n_adj > 0) {
-        plot_title <- sprintf("%s\n覆盖: %.1f%% | 宽度: %.4f | 调整: %d点",
-                              group_names[i], coverage_pct, avg_width, n_adj)
-      }
-      
-      title(plot_title, line = 1.2, cex.main = 1)
-      mtext(side = 1, text = "Age", line = 2.5, cex = 0.9)
+      title(plot_title, line = 1.2, cex.main = 0.95)
+      mtext(side = 1, text = "Time", line = 2.5, cex = 0.9)
       mtext(side = 2, text = expression(beta(t)), line = 2.5, cex = 0.9)
       
     }, error = function(e) {
@@ -2124,11 +1938,12 @@ plot_bootstrap_ci_improved <- function(bootstrap_results,
 }
 
 
-results_fixed <- improved_block_bootstrap_fixed(
+# ===================================================================
+# 使用示例
+# ===================================================================
+
+results <- improved_block_bootstrap_fixed(
   ppmi_data = ppmi_data,
-  B = 100,
-  ci_method = "basic_plus",      # 使用增强的Basic法
+  B = 500,
   verbose = TRUE
 )
-
-plot_bootstrap_ci_improved(results_fixed, group_names = ppmi_data$traits)
